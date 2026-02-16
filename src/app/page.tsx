@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { sendToDify } from "@/lib/api/dify";
 import { 
   Timer, 
   History, 
@@ -43,27 +44,56 @@ interface JournalEntry {
   date: string; // ISO String
   day: string;  // "09"
   dow: string;  // "Fri"
-  whatHappened: string;
-  howFelt: string;
-  tomorrowPlan: string;
+  plans: string[]; // 複数の予定
+  deepDive?: {
+    question: string;
+    answer: string;
+    planIdx: number; // どの予定に対する対話か
+  }[];
+  planSummaries?: string[]; // 各予定ごとのAIアンサー
   mood: string;
+  conversationId?: string;
 }
 
 // --- LocalStorage Helpers ---
 const STORAGE_KEY = "rejournal_entries_v2"; // Version up for new schema
 
-const saveEntry = (whatHappened: string, howFelt: string, tomorrowPlan: string) => {
+const saveEntry = async (plans: string[], deepDive: { question: string, answer: string, planIdx: number }[]) => {
   const now = new Date();
   const dows = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  
+  const validPlans = plans.filter(p => p.trim());
+  
+  // 各予定ごとに個別のアンサーを生成（並列実行で高速化）
+  const summaryPromises = validPlans.map(async (plan, idx) => {
+    const history = deepDive.filter(d => d.planIdx === idx);
+    const query = `
+ユーザー情報: 東京在住、エンジニア、趣味はカフェ巡り。
+予定: ${plan}
+対話履歴:
+${history.map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n")}
+
+上記を踏まえ、この予定に対する具体的な出発時間や準備のアドバイスを1文で返して。
+タメ口でフレンドリーに。
+    `.trim();
+    try {
+      const res = await sendToDify(query, "guest_user");
+      return res.answer;
+    } catch (e) {
+      return "楽しんできてね！準備を忘れずに。";
+    }
+  });
+
+  const planSummaries = await Promise.all(summaryPromises);
   
   const newEntry: JournalEntry = {
     id: crypto.randomUUID(),
     date: now.toISOString(),
     day: now.getDate().toString().padStart(2, "0"),
     dow: dows[now.getDay()],
-    whatHappened,
-    howFelt,
-    tomorrowPlan,
+    plans: validPlans,
+    deepDive,
+    planSummaries,
     mood: "Calm"
   };
 
@@ -81,7 +111,7 @@ const getEntries = (): JournalEntry[] => {
 
 // --- Components ---
 
-const Sidebar = ({ activeTab, setActiveTab }: { activeTab: Tab, setActiveTab: (tab: Tab) => void }) => {
+const Sidebar = ({ activeTab, setActiveTab, onClear }: { activeTab: Tab, setActiveTab: (tab: Tab) => void, onClear: () => void }) => {
   const menuItems = [
     { id: "home", icon: HomeIcon, label: "Home" },
     { id: "history", icon: History, label: "History" },
@@ -109,6 +139,18 @@ const Sidebar = ({ activeTab, setActiveTab }: { activeTab: Tab, setActiveTab: (t
           )}
         </button>
       ))}
+      <div className="w-[1px] h-6 bg-stone-200/50 mx-2" />
+      <button
+        onClick={() => {
+          if (confirm("これまでの記録をすべて削除してもいい？")) {
+            onClear();
+          }
+        }}
+        className="p-2 text-stone-300 hover:text-red-400 transition-colors"
+        title="Clear Data"
+      >
+        <LogOut size={22} />
+      </button>
     </nav>
   );
 };
@@ -186,11 +228,14 @@ const JournalHome = ({ onStart }: { onStart: () => void }) => (
   </motion.div>
 );
 
-const JournalEditor = ({ onFinish }: { onFinish: (data: { whatHappened: string, howFelt: string, tomorrowPlan: string } | null) => void }) => {
+const JournalEditor = ({ onFinish }: { onFinish: (data: { plans: string[], deepDive: { question: string, answer: string, planIdx: number }[] } | null) => void }) => {
   const [step, setStep] = useState(1);
-  const [whatHappened, setWhatHappened] = useState("");
-  const [howFelt, setHowFelt] = useState("");
-  const [tomorrowPlan, setTomorrowPlan] = useState("");
+  const [plans, setPlans] = useState<string[]>([""]);
+  const [deepDive, setDeepDive] = useState<{ question: string, answer: string, planIdx: number }[]>([]);
+  const [currentAnswers, setCurrentAnswers] = useState<string[]>([]);
+  const [currentQuestions, setCurrentQuestions] = useState<string[]>([]);
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [conversationId, setConversationId] = useState("");
   const [timeLeft, setTimeLeft] = useState(300);
 
   useEffect(() => {
@@ -202,14 +247,83 @@ const JournalEditor = ({ onFinish }: { onFinish: (data: { whatHappened: string, 
 
   const formatTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
 
-  const currentText = step === 1 ? whatHappened : step === 2 ? howFelt : tomorrowPlan;
-  const setCurrentText = step === 1 ? setWhatHappened : step === 2 ? setHowFelt : setTomorrowPlan;
-  
-  const questions = [
-    "What happened today?",
-    "How did you feel?",
-    "What's the plan for tomorrow?"
-  ];
+  const addPlan = () => setPlans([...plans, ""]);
+  const updatePlan = (index: number, val: string) => {
+    const newPlans = [...plans];
+    newPlans[index] = val;
+    setPlans(newPlans);
+  };
+
+  const startDeepDive = async () => {
+    const validPlans = plans.filter(p => p.trim());
+    if (validPlans.length === 0) return;
+
+    setIsAiLoading(true);
+    try {
+      const query = `
+ユーザー情報: 東京在住、エンジニア。
+以下の各予定について、具体的な「移動手段」を1つだけタメ口で質問して。
+回答形式: 質問1 | 質問2 | ...
+
+予定リスト:
+${validPlans.map((p, i) => `${i + 1}. ${p}`).join("\n")}
+      `.trim();
+
+      const res = await sendToDify(query, "guest_user");
+      const questions = res.answer.split("|").map(q => q.trim());
+      setCurrentQuestions(questions);
+      setCurrentAnswers(new Array(questions.length).fill(""));
+      setConversationId(res.conversation_id);
+      setStep(2);
+    } catch (error) {
+      console.error(error);
+      setCurrentQuestions(validPlans.map(() => "そこへはどうやって行く？"));
+      setCurrentAnswers(new Array(validPlans.length).fill(""));
+      setStep(2);
+    } finally {
+      setIsAiLoading(false);
+    }
+  };
+
+  const nextDeepDive = async () => {
+    const newHistory = [...deepDive];
+    currentQuestions.forEach((q, i) => {
+      if (currentAnswers[i]) {
+        newHistory.push({ question: q, answer: currentAnswers[i], planIdx: i });
+      }
+    });
+    setDeepDive(newHistory);
+
+    if (step === 3) {
+      // Step 3の回答を保存した直後にFinish処理へ
+      onFinish({ plans, deepDive: newHistory });
+      return;
+    }
+
+    setIsAiLoading(true);
+    try {
+      const query = `
+これまでの情報を踏まえ、次は「所要時間」か「出発時間」を1つだけタメ口で質問して。
+回答形式: 質問1 | 質問2 | ...
+
+これまでの回答:
+${currentAnswers.map((a, i) => `${i + 1}. ${a}`).join("\n")}
+      `.trim();
+
+      const res = await sendToDify(query, "guest_user", conversationId);
+      const nextQuestions = res.answer.split("|").map(q => q.trim());
+      setCurrentQuestions(nextQuestions);
+      setCurrentAnswers(new Array(nextQuestions.length).fill(""));
+      setStep(step + 1);
+    } catch (error) {
+      console.error(error);
+      setCurrentQuestions(currentQuestions.map(() => "何時ごろに出発する予定？"));
+      setCurrentAnswers(new Array(currentQuestions.length).fill(""));
+      setStep(step + 1);
+    } finally {
+      setIsAiLoading(false);
+    }
+  };
 
   return (
     <motion.div
@@ -232,115 +346,205 @@ const JournalEditor = ({ onFinish }: { onFinish: (data: { whatHappened: string, 
       </div>
 
       <div className="max-w-4xl mx-auto w-full flex flex-col h-full px-12 relative z-10">
-        <header className="py-16 flex justify-between items-center">
-          <div className="flex items-center gap-8">
+        <header className="py-12 flex justify-between items-center">
             <div className="flex flex-col">
-              <span className="text-[9px] tracking-[0.6em] uppercase text-stone-400 font-bold mb-2">Focus Session</span>
-              <div className="flex items-center gap-4">
-                <span className="text-5xl font-light font-mono text-stone-800 tracking-tighter">
+            <span className="text-[9px] tracking-[0.6em] uppercase text-stone-400 font-bold mb-2">Mind Mapping</span>
+            <div className="flex items-center gap-4">
+              <span className="text-4xl font-light font-mono text-stone-800 tracking-tighter">
                 {formatTime(timeLeft)}
               </span>
-                <div className="flex gap-1">
-                  {[1, 2, 3].map((i) => (
-                    <div key={i} className={cn(
-                      "w-1.5 h-1.5 rounded-full transition-all duration-500",
-                      step === i ? "bg-stone-800 w-4" : "bg-stone-200"
-                    )} />
-                  ))}
-                </div>
+              <div className="flex gap-1">
+                {[1, 2, 3, 4].map((i) => (
+                  <div key={i} className={cn(
+                    "w-1.5 h-1.5 rounded-full transition-all duration-500",
+                    step === i ? "bg-stone-800 w-4" : "bg-stone-200"
+                  )} />
+                ))}
             </div>
             </div>
           </div>
-          
-          <button 
-            onClick={() => onFinish(null)}
-            className="w-12 h-12 rounded-full bg-white border border-stone-100 flex items-center justify-center text-stone-400 hover:text-stone-800 transition-all shadow-sm"
-          >
-            <ArrowLeft size={20} />
+          <button onClick={() => onFinish(null)} className="w-10 h-10 rounded-full bg-white border border-stone-100 flex items-center justify-center text-stone-400 hover:text-stone-800 shadow-sm">
+            <ArrowLeft size={18} />
           </button>
         </header>
 
-        <main className="flex-1 flex flex-col relative py-4">
+        <main className="flex-1 flex flex-col relative py-4 overflow-y-auto scrollbar-hide">
           <AnimatePresence mode="wait">
-            <motion.div
-              key={step}
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              transition={{ duration: 0.5 }}
-              className="flex-1 flex flex-col"
-            >
-              <p className="text-[10px] tracking-[0.4em] uppercase text-stone-300 font-bold mb-6">Step {step}</p>
-              <h3 className="text-2xl font-serif text-stone-400 mb-8 italic">{questions[step - 1]}</h3>
-              <div className="flex-1 flex flex-col bg-white/40 backdrop-blur-sm rounded-[2rem] border border-stone-200/50 shadow-inner relative group transition-all duration-500 focus-within:border-stone-300">
-          <textarea
-            autoFocus
-                  value={currentText}
-                  onChange={(e) => setCurrentText(e.target.value)}
-                  placeholder="Type here..."
-                  className="flex-1 bg-transparent border-none focus:ring-0 outline-none text-2xl font-serif font-light leading-[1.6] text-stone-800 placeholder-stone-200 resize-none scrollbar-hide z-20 p-8"
-                />
-                
-                {/* 装飾的なフォーカスインジケーター */}
-                <div className="absolute bottom-4 right-6 opacity-20 group-focus-within:opacity-40 transition-opacity">
-                  <Pen size={16} className="text-stone-400" />
+            {step === 1 && (
+              <motion.div key="step1" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="space-y-8">
+                <div>
+                  <p className="text-[10px] tracking-[0.4em] uppercase text-stone-300 font-bold mb-4">Step 1</p>
+                  <h3 className="text-3xl font-serif text-stone-800 mb-2">What's on your mind?</h3>
+                  <p className="text-stone-400 text-sm italic">今日（または明日）の予定や、考えていることを教えてください。</p>
                 </div>
-              </div>
-            </motion.div>
+                <div className="space-y-4">
+                  {plans.map((plan, i) => (
+                    <motion.div key={i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="relative group">
+                      <input
+                        value={plan}
+                        onChange={(e) => updatePlan(i, e.target.value)}
+                        placeholder={i === 0 ? "例: 病院に行く" : "他にもあれば..."}
+                        className="w-full bg-white/40 backdrop-blur-sm border border-stone-200/50 rounded-2xl p-6 text-xl font-serif text-stone-800 placeholder-stone-200 outline-none focus:border-stone-300 transition-all"
+                      />
+                    </motion.div>
+                  ))}
+                  <button onClick={addPlan} className="flex items-center gap-2 text-stone-400 hover:text-stone-600 transition-colors pl-2">
+                    <Plus size={16} />
+                    <span className="text-[10px] tracking-widest uppercase font-bold">Add another</span>
+                  </button>
+                </div>
+              </motion.div>
+            )}
+
+            {(step === 2 || step === 3) && (
+              <motion.div key={`step${step}`} initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="space-y-8">
+                <div>
+                  <p className="text-[10px] tracking-[0.4em] uppercase text-stone-300 font-bold mb-4">Step {step}: {step === 2 ? "Deep Dive" : "Further Exploration"}</p>
+                  <h3 className="text-2xl font-serif text-stone-600 italic leading-relaxed">
+                    {isAiLoading ? "AIが思考を深めています..." : "もう少し詳しく教えてください。"}
+                  </h3>
+                </div>
+                <div className="space-y-12">
+                  {!isAiLoading && currentQuestions.map((q, i) => (
+                    <div key={i} className="space-y-4 relative">
+                      <div className="flex items-center gap-3 mb-2">
+                        <div className="w-6 h-6 rounded-full bg-stone-900 text-white text-[10px] flex items-center justify-center font-bold">
+                          {i + 1}
+                        </div>
+                        <p className="text-[10px] tracking-widest uppercase text-stone-400 font-bold">
+                          Regarding: {plans.filter(p => p.trim())[i]}
+                        </p>
+                      </div>
+                      <div className="bg-stone-50 p-6 rounded-3xl border border-stone-100 relative overflow-hidden group transition-all hover:border-stone-200">
+                        <div className="absolute top-0 left-0 w-1 h-full bg-stone-200 group-hover:bg-stone-400 transition-colors" />
+                        <p className="text-sm font-serif text-stone-600 leading-relaxed italic">{q}</p>
+                      </div>
+          <textarea
+                        value={currentAnswers[i] || ""}
+                        onChange={(e) => {
+                          const newAns = [...currentAnswers];
+                          newAns[i] = e.target.value;
+                          setCurrentAnswers(newAns);
+                        }}
+                        placeholder="回答を入力..."
+                        className="w-full h-32 bg-white/40 backdrop-blur-sm border border-stone-200/50 rounded-[1.5rem] p-6 text-lg font-serif text-stone-800 placeholder-stone-200 outline-none focus:border-stone-300 transition-all resize-none shadow-inner"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </motion.div>
+            )}
+
+            {step === 4 && (
+              <motion.div key="step4" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="space-y-10 py-8">
+                <div className="text-center">
+                  <div className="w-16 h-16 bg-stone-900 text-white rounded-3xl flex items-center justify-center mx-auto mb-6 shadow-xl">
+                    <Check size={32} />
+                  </div>
+                  <h3 className="text-3xl font-serif text-stone-800">Your thoughts are clear.</h3>
+                  <p className="text-stone-400 italic mt-2 text-sm">対話を通じて、今日の大切なことが見えてきたよ。</p>
+                </div>
+
+                <div className="bg-white/60 backdrop-blur-md rounded-[3rem] p-10 border border-stone-100 shadow-sm space-y-12">
+                  {plans.filter(p => p.trim()).map((plan, planIdx) => (
+                    <div key={planIdx} className="space-y-6">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-full bg-stone-900 text-white flex items-center justify-center text-xs font-bold shadow-lg">
+                          {planIdx + 1}
+                        </div>
+                        <h4 className="text-xl font-serif text-stone-800">{plan}</h4>
+                      </div>
+                      
+                      <div className="space-y-4 border-l-2 border-stone-50 ml-4 pl-8">
+                        {deepDive.filter(d => d.planIdx === planIdx).map((d, i) => (
+                          <div key={i} className="space-y-1">
+                            <p className="text-[10px] text-stone-300 uppercase tracking-widest font-bold">Q: {d.question}</p>
+                            <p className="text-stone-600 font-serif">{d.answer}</p>
+                          </div>
+                        ))}
+                        
+                        {/* 各予定ごとのAIアンサー（保存後に表示されるように調整が必要なため、ここではプレースホルダー） */}
+                        <div className="mt-6 bg-stone-50 p-6 rounded-2xl border border-stone-100 italic text-stone-500 text-sm">
+                          <Sparkles size={14} className="mb-2 text-stone-400" />
+                          AIがこの予定のアドバイスをまとめているよ...
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </motion.div>
+            )}
           </AnimatePresence>
         </main>
 
-        <footer className="py-16 flex justify-end">
-          {step < 3 ? (
-            <motion.button
-              onClick={() => setStep(step + 1)}
-              disabled={!currentText}
-              whileHover={currentText ? { scale: 1.05 } : {}}
-              whileTap={currentText ? { scale: 0.95 } : {}}
-              className={cn(
-                "group relative w-24 h-24 flex items-center justify-center transition-all duration-700",
-                currentText ? "opacity-100" : "opacity-20 cursor-not-allowed"
-              )}
-            >
-              <div className={cn(
-                "absolute inset-0 rounded-[2rem] rotate-45 transition-transform duration-700 shadow-2xl",
-                currentText ? "bg-stone-900 group-hover:rotate-90" : "bg-stone-200"
-              )} />
-              <div className="relative z-10 text-white flex flex-col items-center gap-1">
-                <ArrowRight size={28} strokeWidth={2} />
-                <span className="text-[8px] tracking-[0.3em] font-bold uppercase">Next</span>
-          </div>
-            </motion.button>
+        <footer className="py-12 flex justify-end">
+          {isAiLoading ? (
+            <div className="w-20 h-20 flex items-center justify-center">
+              <motion.div
+                animate={{ rotate: 360 }}
+                transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
+                className="w-10 h-10 border-2 border-stone-100 border-t-stone-900 rounded-full"
+              />
+            </div>
           ) : (
-          <motion.button
-              onClick={() => onFinish({ whatHappened, howFelt, tomorrowPlan })}
-              disabled={!currentText}
-              whileHover={currentText ? { scale: 1.05 } : {}}
-              whileTap={currentText ? { scale: 0.95 } : {}}
-            className={cn(
-                "group relative w-24 h-24 flex items-center justify-center transition-all duration-700",
-                currentText ? "opacity-100" : "opacity-20 cursor-not-allowed"
+            <>
+              {step === 1 && (
+                <motion.button
+                  onClick={startDeepDive}
+                  disabled={!plans[0]}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  className={cn(
+                    "group relative w-20 h-20 flex items-center justify-center",
+                    (!plans[0]) && "opacity-20"
+                  )}
+                >
+                  <div className="absolute inset-0 bg-stone-900 rounded-2xl rotate-45 group-hover:rotate-90 transition-transform duration-700 shadow-xl" />
+                  <div className="relative z-10 text-white flex flex-col items-center gap-1">
+                    <ArrowRight size={24} />
+                    <span className="text-[7px] tracking-widest uppercase font-bold">Next</span>
+                  </div>
+                </motion.button>
               )}
-            >
-              <div className={cn(
-                "absolute inset-0 rounded-[2rem] rotate-45 transition-transform duration-700 shadow-2xl",
-                currentText ? "bg-stone-900 group-hover:rotate-90" : "bg-stone-200"
-              )} />
-              <div className="relative z-10 text-white flex flex-col items-center gap-1">
-                <Check size={28} strokeWidth={2} />
-                <span className="text-[8px] tracking-[0.3em] font-bold uppercase">Finish</span>
-              </div>
-              {currentText && (
-                <motion.div
-                  animate={{ scale: [1, 1.5], opacity: [0.3, 0] }}
-                  transition={{ duration: 2, repeat: Infinity }}
-                  className="absolute inset-0 border border-stone-900 rounded-[2rem] rotate-45"
-                />
+              {(step === 2 || step === 3) && (
+                <motion.button
+                  onClick={nextDeepDive}
+                  disabled={currentAnswers.every(a => !a)}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  className={cn(
+                    "group relative w-20 h-20 flex items-center justify-center",
+                    (currentAnswers.every(a => !a)) && "opacity-20"
+                  )}
+                >
+                  <div className="absolute inset-0 bg-stone-900 rounded-2xl rotate-45 group-hover:rotate-90 transition-transform duration-700 shadow-xl" />
+                  <div className="relative z-10 text-white flex flex-col items-center gap-1">
+                    <ArrowRight size={24} />
+                    <span className="text-[7px] tracking-widest uppercase font-bold">
+                      {step === 3 ? "Finish" : "Next"}
+                    </span>
+                  </div>
+                </motion.button>
               )}
-            </motion.button>
+            </>
           )}
         </footer>
       </div>
+
+      {/* 結果画面表示後のクローズボタン（Finish後に表示） */}
+      {step === 4 && (
+        <div className="absolute top-8 right-8 z-[70]">
+          <button 
+            onClick={() => {
+              // エディタを完全に閉じてホームへ
+              window.dispatchEvent(new CustomEvent('close-editor'));
+            }}
+            className="w-12 h-12 rounded-full bg-white/80 backdrop-blur shadow-lg border border-stone-100 flex items-center justify-center text-stone-400 hover:text-stone-900 transition-all"
+          >
+            <Plus size={24} className="rotate-45" />
+          </button>
+        </div>
+      )}
     </motion.div>
   );
 };
@@ -374,10 +578,10 @@ const HistoryView = ({ entries }: { entries: JournalEntry[] }) => {
                 <span className="text-[8px] font-bold tracking-tighter opacity-50 mb-0.5 uppercase">{item.dow}</span>
                 <span className="text-xl font-serif leading-none">{item.day}</span>
               </div>
-              <div className="flex-1 border-b border-stone-100 pt-6 pb-4 group-last:border-none flex items-center">
-                <h3 className="text-lg font-serif font-medium text-stone-800 group-hover:text-stone-500 transition-colors line-clamp-1">
-                  {item.whatHappened.split('\n')[0]}
-                </h3>
+            <div className="flex-1 border-b border-stone-100 pt-6 pb-4 group-last:border-none flex items-center">
+              <h3 className="text-lg font-serif font-medium text-stone-800 group-hover:text-stone-500 transition-colors line-clamp-1">
+                {item.plans && item.plans.length > 0 ? item.plans[0] : "No Title"}
+              </h3>
             </div>
           </motion.div>
         ))
@@ -415,7 +619,7 @@ const HistoryView = ({ entries }: { entries: JournalEntry[] }) => {
                 </button>
               </div>
 
-              <div className="p-10 pt-16 space-y-10">
+              <div className="p-10 pt-16 space-y-10 max-h-[80vh] overflow-y-auto scrollbar-hide">
                 <div className="flex items-center gap-6">
                   <div className="flex flex-col items-center w-14 h-14 bg-stone-900 text-white rounded-2xl justify-center shadow-lg">
                     <span className="text-[7px] font-bold tracking-widest uppercase opacity-60 mb-0.5">{selectedEntry.dow}</span>
@@ -429,43 +633,35 @@ const HistoryView = ({ entries }: { entries: JournalEntry[] }) => {
                   </div>
                 </div>
 
-                <div className="space-y-12 relative">
-                  {/* 1. What happened */}
-                  <div className="space-y-3 relative z-10">
-                    <p className="text-[9px] tracking-[0.3em] uppercase text-stone-300 font-bold flex items-center gap-2">
-                      <span className="w-4 h-[1px] bg-stone-100" /> 1. What happened
-                    </p>
-                    <p className="text-stone-800 font-serif leading-relaxed pl-6 border-l border-stone-50">
-                      {selectedEntry.whatHappened}
-                    </p>
-                  </div>
-
-                  {/* 2. How I felt */}
-                  <div className="space-y-3 relative z-10">
-                    <p className="text-[9px] tracking-[0.3em] uppercase text-stone-300 font-bold flex items-center gap-2">
-                      <span className="w-4 h-[1px] bg-stone-100" /> 2. How I felt
-                    </p>
-                    <p className="text-stone-800 font-serif leading-relaxed pl-6 border-l border-stone-50">
-                      {selectedEntry.howFelt}
-                    </p>
-                  </div>
-
-                  {/* 3. Tomorrow's plan */}
-                  <div className="space-y-3 relative z-10">
-                    <p className="text-[9px] tracking-[0.3em] uppercase text-stone-300 font-bold flex items-center gap-2">
-                      <span className="w-4 h-[1px] bg-stone-100" /> 3. Tomorrow's plan
-                    </p>
-                    <p className="text-stone-800 font-serif leading-relaxed pl-6 border-l border-stone-50">
-                      {selectedEntry.tomorrowPlan}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="pt-4 flex justify-center">
-                  <div className="px-4 py-2 bg-stone-50 rounded-full flex items-center gap-2">
-                    <Sparkles size={12} className="text-stone-300" />
-                    <span className="text-[9px] tracking-widest uppercase text-stone-400 font-bold">AI Analysis Pending</span>
-                  </div>
+                <div className="space-y-12 max-h-[80vh] overflow-y-auto scrollbar-hide">
+                  {selectedEntry.plans.map((plan, planIdx) => (
+                    <div key={planIdx} className="space-y-6">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-full bg-stone-900 text-white flex items-center justify-center text-xs font-bold shadow-lg">
+                          {planIdx + 1}
+                        </div>
+                        <h4 className="text-xl font-serif text-stone-800">{plan}</h4>
+                      </div>
+                      
+                      <div className="space-y-4 border-l-2 border-stone-50 ml-4 pl-8">
+                        {selectedEntry.deepDive
+                          ?.filter(d => d.planIdx === planIdx)
+                          .map((d, i) => (
+                            <div key={i} className="space-y-1">
+                              <p className="text-[10px] text-stone-300 uppercase tracking-widest font-bold">Q: {d.question}</p>
+                              <p className="text-stone-600 font-serif">{d.answer}</p>
+                            </div>
+                          ))}
+                        
+                        {selectedEntry.planSummaries?.[planIdx] && (
+                          <div className="mt-6 bg-stone-50 p-6 rounded-2xl border border-stone-100 italic text-stone-600 text-sm leading-relaxed">
+                            <Sparkles size={14} className="mb-2 text-stone-400" />
+                            "{selectedEntry.planSummaries[planIdx]}"
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
       </div>
     </div>
             </motion.div>
@@ -601,17 +797,34 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<Tab>("home");
   const [isWriting, setIsWriting] = useState(false);
   const [entries, setEntries] = useState<JournalEntry[]>([]);
+  const [showLatestEntry, setShowLatestEntry] = useState<JournalEntry | null>(null);
 
   useEffect(() => {
     setEntries(getEntries());
+
+    const handleClose = () => {
+      setIsWriting(false);
+      setActiveTab("home");
+    };
+    window.addEventListener('close-editor', handleClose);
+    return () => window.removeEventListener('close-editor', handleClose);
   }, []);
 
-  const handleFinishWriting = (data: { whatHappened: string, howFelt: string, tomorrowPlan: string } | null) => {
+  const handleFinishWriting = async (data: { plans: string[], deepDive: { question: string, answer: string, planIdx: number }[] } | null) => {
     if (data) {
-      const updated = saveEntry(data.whatHappened, data.howFelt, data.tomorrowPlan);
+      const updated = await saveEntry(data.plans, data.deepDive);
       setEntries(updated);
+      setIsWriting(false);
+      setShowLatestEntry(updated[0]); // 最新の投稿をモーダルで表示
+    } else {
+      setIsWriting(false);
     }
-    setIsWriting(false);
+  };
+
+  const handleClearData = () => {
+    localStorage.removeItem(STORAGE_KEY);
+    setEntries([]);
+    alert("データをすべて削除したよ。");
   };
 
   return (
@@ -647,7 +860,89 @@ export default function Home() {
           )}
         </AnimatePresence>
 
-        <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
+        {/* 執筆直後の結果表示モーダル */}
+        <AnimatePresence>
+          {showLatestEntry && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-[#FDFCFB]/80 backdrop-blur-xl z-[70] flex items-center justify-center p-8"
+              onClick={() => {
+                setShowLatestEntry(null);
+                setActiveTab("home");
+              }}
+            >
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0, y: 20 }}
+                animate={{ scale: 1, opacity: 1, y: 0 }}
+                exit={{ scale: 0.9, opacity: 0, y: 20 }}
+                className="bg-white w-full max-w-lg rounded-[3rem] shadow-[0_30px_100px_rgba(0,0,0,0.1)] border border-stone-100 overflow-hidden relative"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="absolute top-0 right-0 p-8">
+                  <button 
+                    onClick={() => {
+                      setShowLatestEntry(null);
+                      setActiveTab("home");
+                    }}
+                    className="w-10 h-10 rounded-full bg-stone-50 flex items-center justify-center text-stone-400 hover:text-stone-900 transition-colors"
+                  >
+                    <Plus size={20} className="rotate-45" />
+                  </button>
+                </div>
+
+                <div className="p-10 pt-16 space-y-10 max-h-[80vh] overflow-y-auto scrollbar-hide">
+                  <div className="flex items-center gap-6">
+                    <div className="flex flex-col items-center w-14 h-14 bg-stone-900 text-white rounded-2xl justify-center shadow-lg">
+                      <span className="text-[7px] font-bold tracking-widest uppercase opacity-60 mb-0.5">{showLatestEntry.dow}</span>
+                      <span className="text-lg font-serif leading-none">{showLatestEntry.day}</span>
+                    </div>
+                    <div>
+                      <h4 className="text-[10px] tracking-[0.4em] uppercase text-stone-300 font-bold mb-1">Journal Entry</h4>
+                      <p className="text-stone-500 font-serif italic text-sm">
+                        {new Date(showLatestEntry.date).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-12">
+                    {showLatestEntry.plans.map((plan, planIdx) => (
+                      <div key={planIdx} className="space-y-6">
+                        <div className="flex items-center gap-3">
+                          <div className="w-8 h-8 rounded-full bg-stone-900 text-white flex items-center justify-center text-xs font-bold shadow-lg">
+                            {planIdx + 1}
+                          </div>
+                          <h4 className="text-xl font-serif text-stone-800">{plan}</h4>
+                        </div>
+                        
+                        <div className="space-y-4 border-l-2 border-stone-50 ml-4 pl-8">
+                          {showLatestEntry.deepDive
+                            ?.filter(d => d.planIdx === planIdx)
+                            .map((d, i) => (
+                              <div key={i} className="space-y-1">
+                                <p className="text-[10px] text-stone-300 uppercase tracking-widest font-bold">Q: {d.question}</p>
+                                <p className="text-stone-600 font-serif">{d.answer}</p>
+                              </div>
+                            ))}
+                          
+                          {showLatestEntry.planSummaries?.[planIdx] && (
+                            <div className="mt-6 bg-stone-50 p-6 rounded-2xl border border-stone-100 italic text-stone-600 text-sm leading-relaxed">
+                              <Sparkles size={14} className="mb-2 text-stone-400" />
+                              "{showLatestEntry.planSummaries[planIdx]}"
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} onClear={handleClearData} />
       </div>
     </div>
   );

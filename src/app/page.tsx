@@ -219,7 +219,7 @@ const Sidebar = ({ activeTab, setActiveTab, onClear }: { activeTab: Tab, setActi
     "pointer-events-none absolute left-1/2 z-[60] w-max max-w-[140px] -translate-x-1/2 whitespace-nowrap rounded-xl border border-white/10 bg-stone-900/95 px-3 py-1.5 text-center text-[11px] font-semibold tracking-wide text-white shadow-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-visible:opacity-100";
 
   return (
-    <nav className="fixed bottom-8 left-1/2 -translate-x-1/2 overflow-visible bg-white/40 backdrop-blur-2xl border border-white/20 rounded-[2rem] px-6 py-4 shadow-[0_8px_32px_rgba(0,0,0,0.05)] z-50 grid grid-cols-5 items-center justify-items-center w-[min(92vw,460px)]">
+    <nav className="fixed bottom-8 left-1/2 -translate-x-1/2 overflow-visible bg-white/40 backdrop-blur-2xl border border-white/20 rounded-[2rem] px-6 py-4 shadow-[0_8px_32px_rgba(0,0,0,0.05)] z-[65] grid grid-cols-5 items-center justify-items-center w-[min(92vw,460px)]">
       {menuItems.map((item) => (
         <button
           key={item.id}
@@ -1334,9 +1334,16 @@ export default function Home() {
   };
 
   const handleClearData = () => {
+    if (isWriting) setIsWriting(false);
     localStorage.removeItem(STORAGE_KEY);
     setEntries([]);
     alert("データをすべて削除したよ。");
+  };
+
+  /** ジャーナル執筆中でもメニューが使えるよう、先に執筆を中止（未保存）してからタブを切り替える */
+  const requestTabChange = (tab: Tab) => {
+    if (isWriting) setIsWriting(false);
+    setActiveTab(tab);
   };
 
   return (
@@ -1467,7 +1474,7 @@ export default function Home() {
         </AnimatePresence>
       </div>
     </div>
-    <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} onClear={handleClearData} />
+    <Sidebar activeTab={activeTab} setActiveTab={requestTabChange} onClear={handleClearData} />
     </>
   );
 }

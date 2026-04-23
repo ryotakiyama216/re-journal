@@ -1,42 +1,38 @@
-export interface DifyChatResponse {
-  event: string;
-  message_id: string;
-  conversation_id: string;
-  answer: string;
-  created_at: number;
-}
+import type { DifyChatResponse } from "@/lib/api/dify-parse";
 
+export type { DifyChatResponse };
+
+/**
+ * ブラウザから Dify を直接叩くと CORS で落ちることが多いため、
+ * Next の API Route 経由で呼び出す。
+ */
 export const sendToDify = async (
   query: string,
   user: string,
   conversationId?: string
-): Promise<DifyChatResponse> => {
-  const apiKey = process.env.NEXT_PUBLIC_DIFY_API_KEY;
-  const apiUrl = "https://api.dify.ai/v1"; // URLを直接指定して404を回避
-
-  if (!apiKey) {
-    throw new Error("Dify API key is not configured.");
-  }
-
-  const response = await fetch(`${apiUrl}/chat-messages`, {
+) => {
+  const response = await fetch("/api/dify/chat", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      inputs: {},
-      query: query,
-      response_mode: "blocking",
-      user: user,
-      conversation_id: conversationId || "",
+      query,
+      user,
+      conversationId: conversationId || undefined,
     }),
   });
 
+  const bodyText = await response.text();
+
   if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.message || "Failed to communicate with Dify");
+    let detail = bodyText.slice(0, 300);
+    try {
+      const err = JSON.parse(bodyText) as { error?: string; message?: string };
+      detail = err.error || err.message || detail;
+    } catch {
+      /* そのまま */
+    }
+    throw new Error(detail || `Dify proxy failed (${response.status})`);
   }
 
-  return response.json();
+  return JSON.parse(bodyText) as DifyChatResponse;
 };

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { sendToDify } from "@/lib/api/dify";
 import { 
@@ -53,12 +53,70 @@ interface JournalEntry {
   planSummaries?: string[]; // 各予定ごとのAIアンサー
   mood: string;
   conversationId?: string;
+  /** 5分タイムアウトなどで未完了のまま保存したとき */
+  incomplete?: boolean;
+}
+
+interface UserProfileData {
+  residence: string;
+  age: string;
+  occupation: string;
+  hobbies: string[];
 }
 
 // --- LocalStorage Helpers ---
 const STORAGE_KEY = "rejournal_entries_v2"; // Version up for new schema
+const USER_PROFILE_KEY = "rejournal_user_profile_v1";
+const EMPTY_USER_PROFILE: UserProfileData = {
+  residence: "",
+  age: "",
+  occupation: "",
+  hobbies: [""],
+};
 
-const saveEntry = async (plans: string[], deepDive: { question: string, answer: string, planIdx: number }[]) => {
+const getUserProfile = (): UserProfileData => {
+  if (typeof window === "undefined") return EMPTY_USER_PROFILE;
+  const raw = localStorage.getItem(USER_PROFILE_KEY);
+  if (!raw) return EMPTY_USER_PROFILE;
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<UserProfileData>;
+    return {
+      residence: parsed.residence || "",
+      age: parsed.age || "",
+      occupation: parsed.occupation || "",
+      hobbies: parsed.hobbies && parsed.hobbies.length > 0 ? parsed.hobbies : [""],
+    };
+  } catch {
+    // 旧バージョン（文字列保存）の互換
+    return {
+      ...EMPTY_USER_PROFILE,
+      occupation: raw,
+    };
+  }
+};
+
+const saveUserProfile = (profile: UserProfileData) => {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(USER_PROFILE_KEY, JSON.stringify(profile));
+};
+
+const resolveUserProfileForPrompt = (profile: UserProfileData) => {
+  const hobbies = profile.hobbies.map((h) => h.trim()).filter(Boolean);
+  const lines = [
+    `住まい: ${profile.residence.trim() || "未設定"}`,
+    `年齢: ${profile.age.trim() || "未設定"}`,
+    `職業: ${profile.occupation.trim() || "未設定"}`,
+    `趣味: ${hobbies.length > 0 ? hobbies.join("、") : "未設定"}`,
+  ];
+  return lines.join("\n");
+};
+
+const saveEntry = async (
+  plans: string[],
+  deepDive: { question: string, answer: string, planIdx: number }[],
+  userProfile: UserProfileData
+) => {
   const now = new Date();
   const dows = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   
@@ -68,18 +126,23 @@ const saveEntry = async (plans: string[], deepDive: { question: string, answer: 
   const summaryPromises = validPlans.map(async (plan, idx) => {
     const history = deepDive.filter(d => d.planIdx === idx);
     const query = `
-ユーザー情報: 東京在住、エンジニア、趣味はカフェ巡り。
+ユーザー情報: ${resolveUserProfileForPrompt(userProfile)}
 予定: ${plan}
 対話履歴:
 ${history.map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n")}
 
-上記を踏まえ、この予定に対する具体的な出発時間や準備のアドバイスを1文で返して。
-タメ口でフレンドリーに。
+上記の対話履歴・予定内容・ユーザー情報をすべて踏まえて、この予定に対する具体的な1日のアドバイスをタメ口でフレンドリーに返して。
+以下の内容をできる限り含めること:
+- 準備すべきこと・持ち物
+- 時間の使い方や行動の順番
+- この予定をより楽しむためのちょっとしたコツや提案
+- 1日をポジティブに締めくくれるような一言
     `.trim();
     try {
       const res = await sendToDify(query, "guest_user");
       return res.answer;
     } catch (e) {
+      console.error("[saveEntry] Dify summary failed", { plan, idx, error: e });
       return "楽しんできてね！準備を忘れずに。";
     }
   });
@@ -95,6 +158,39 @@ ${history.map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n")}
     deepDive,
     planSummaries,
     mood: "Calm"
+  };
+
+  const existing = getEntries();
+  const updated = [newEntry, ...existing];
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+  return updated;
+};
+
+const saveIncompleteEntry = (
+  plans: string[],
+  deepDive: { question: string; answer: string; planIdx: number }[]
+) => {
+  const now = new Date();
+  const dows = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const validPlans = plans.filter((p) => p.trim());
+  const displayPlans =
+    validPlans.length > 0
+      ? validPlans
+      : ["（5分の制限に達し、入力が完了しませんでした）"];
+
+  const summaryNote =
+    "※ 制限時間のため途中の内容のみ保存されています。AIの締めの一文はありません。";
+
+  const newEntry: JournalEntry = {
+    id: crypto.randomUUID(),
+    date: now.toISOString(),
+    day: now.getDate().toString().padStart(2, "0"),
+    dow: dows[now.getDay()],
+    plans: displayPlans,
+    deepDive: deepDive.length > 0 ? deepDive : undefined,
+    planSummaries: displayPlans.map(() => summaryNote),
+    mood: "Calm",
+    incomplete: true,
   };
 
   const existing = getEntries();
@@ -119,17 +215,25 @@ const Sidebar = ({ activeTab, setActiveTab, onClear }: { activeTab: Tab, setActi
     { id: "settings", icon: Settings, label: "Settings" },
   ];
 
+  const navTooltipClass =
+    "pointer-events-none absolute left-1/2 z-[60] w-max max-w-[140px] -translate-x-1/2 whitespace-nowrap rounded-xl border border-white/10 bg-stone-900/95 px-3 py-1.5 text-center text-[11px] font-semibold tracking-wide text-white shadow-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-visible:opacity-100";
+
   return (
-    <nav className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-white/40 backdrop-blur-2xl border border-white/20 rounded-[2rem] px-6 py-4 shadow-[0_8px_32px_rgba(0,0,0,0.05)] z-50 flex items-center gap-10">
+    <nav className="fixed bottom-8 left-1/2 -translate-x-1/2 overflow-visible bg-white/40 backdrop-blur-2xl border border-white/20 rounded-[2rem] px-6 py-4 shadow-[0_8px_32px_rgba(0,0,0,0.05)] z-50 grid grid-cols-5 items-center justify-items-center w-[min(92vw,460px)]">
       {menuItems.map((item) => (
         <button
           key={item.id}
+          type="button"
+          aria-label={item.label}
           onClick={() => setActiveTab(item.id as Tab)}
           className={cn(
-            "relative p-2 transition-all duration-500 group",
+            "relative flex flex-col items-center justify-center p-2 transition-all duration-500 group outline-none",
             activeTab === item.id ? "text-stone-900 scale-110" : "text-stone-300 hover:text-stone-500"
           )}
         >
+          <span className={`${navTooltipClass} bottom-[calc(100%+10px)]`} role="tooltip">
+            {item.label}
+          </span>
           <item.icon size={26} strokeWidth={activeTab === item.id ? 2 : 1.5} />
           {activeTab === item.id && (
             <motion.div
@@ -139,16 +243,19 @@ const Sidebar = ({ activeTab, setActiveTab, onClear }: { activeTab: Tab, setActi
           )}
         </button>
       ))}
-      <div className="w-[1px] h-6 bg-stone-200/50 mx-2" />
       <button
+        type="button"
+        aria-label="Clear all journal data"
         onClick={() => {
           if (confirm("これまでの記録をすべて削除してもいい？")) {
             onClear();
           }
         }}
-        className="p-2 text-stone-300 hover:text-red-400 transition-colors"
-        title="Clear Data"
+        className="group relative flex flex-col items-center justify-center p-2 text-stone-300 outline-none transition-colors hover:text-red-400 focus-visible:text-red-400"
       >
+        <span className={`${navTooltipClass} bottom-[calc(100%+10px)]`} role="tooltip">
+          Clear
+        </span>
         <LogOut size={22} />
       </button>
     </nav>
@@ -228,7 +335,21 @@ const JournalHome = ({ onStart }: { onStart: () => void }) => (
   </motion.div>
 );
 
-const JournalEditor = ({ onFinish }: { onFinish: (data: { plans: string[], deepDive: { question: string, answer: string, planIdx: number }[] } | null) => void }) => {
+type JournalFinishPayload = {
+  plans: string[];
+  deepDive: { question: string; answer: string; planIdx: number }[];
+  incomplete?: boolean;
+};
+
+const JOURNAL_TIME_LIMIT_SEC = 300;
+
+const JournalEditor = ({
+  onFinish,
+  userProfile,
+}: {
+  onFinish: (data: JournalFinishPayload | null) => void;
+  userProfile: UserProfileData;
+}) => {
   const [step, setStep] = useState(1);
   const [plans, setPlans] = useState<string[]>([""]);
   const [deepDive, setDeepDive] = useState<{ question: string, answer: string, planIdx: number }[]>([]);
@@ -236,7 +357,31 @@ const JournalEditor = ({ onFinish }: { onFinish: (data: { plans: string[], deepD
   const [currentQuestions, setCurrentQuestions] = useState<string[]>([]);
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [conversationId, setConversationId] = useState("");
-  const [timeLeft, setTimeLeft] = useState(300);
+  const [timeLeft, setTimeLeft] = useState(JOURNAL_TIME_LIMIT_SEC);
+
+  const snapshotRef = useRef({
+    step: 1,
+    plans: [""] as string[],
+    deepDive: [] as { question: string; answer: string; planIdx: number }[],
+    currentQuestions: [] as string[],
+    currentAnswers: [] as string[],
+  });
+  useEffect(() => {
+    snapshotRef.current = {
+      step,
+      plans,
+      deepDive,
+      currentQuestions,
+      currentAnswers,
+    };
+  }, [step, plans, deepDive, currentQuestions, currentAnswers]);
+
+  const onFinishRef = useRef(onFinish);
+  useEffect(() => {
+    onFinishRef.current = onFinish;
+  }, [onFinish]);
+
+  const hasEndedRef = useRef(false);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -244,6 +389,19 @@ const JournalEditor = ({ onFinish }: { onFinish: (data: { plans: string[], deepD
     }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (timeLeft > 0 || hasEndedRef.current) return;
+    hasEndedRef.current = true;
+    const s = snapshotRef.current;
+    const merged: { question: string; answer: string; planIdx: number }[] = [...s.deepDive];
+    s.currentQuestions.forEach((q: string, i: number) => {
+      if (s.currentAnswers[i]?.trim()) {
+        merged.push({ question: q, answer: s.currentAnswers[i], planIdx: i });
+      }
+    });
+    onFinishRef.current({ plans: s.plans, deepDive: merged, incomplete: true });
+  }, [timeLeft]);
 
   const formatTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
 
@@ -255,14 +413,16 @@ const JournalEditor = ({ onFinish }: { onFinish: (data: { plans: string[], deepD
   };
 
   const startDeepDive = async () => {
+    if (timeLeft <= 0 || hasEndedRef.current) return;
     const validPlans = plans.filter(p => p.trim());
     if (validPlans.length === 0) return;
 
     setIsAiLoading(true);
     try {
       const query = `
-ユーザー情報: 東京在住、エンジニア。
-以下の各予定について、具体的な「移動手段」を1つだけタメ口で質問して。
+ユーザー情報: ${resolveUserProfileForPrompt(userProfile)}。
+以下の各予定について、その予定をより具体的に把握するための質問を1つだけタメ口でして。
+質問は予定の内容に応じて柔軟に選ぶこと（例: 誰と行くか・目的・場所・何をするか・楽しみにしていること・気になっていることなど）。特定の観点に限定しない。
 回答形式: 質問1 | 質問2 | ...
 
 予定リスト:
@@ -276,8 +436,8 @@ ${validPlans.map((p, i) => `${i + 1}. ${p}`).join("\n")}
       setConversationId(res.conversation_id);
       setStep(2);
     } catch (error) {
-      console.error(error);
-      setCurrentQuestions(validPlans.map(() => "そこへはどうやって行く？"));
+      console.error("[JournalEditor] startDeepDive / Dify failed", error);
+      setCurrentQuestions(validPlans.map(() => "その予定、どんな感じになりそう？"));
       setCurrentAnswers(new Array(validPlans.length).fill(""));
       setStep(2);
     } finally {
@@ -286,6 +446,7 @@ ${validPlans.map((p, i) => `${i + 1}. ${p}`).join("\n")}
   };
 
   const nextDeepDive = async () => {
+    if (timeLeft <= 0 || hasEndedRef.current) return;
     const newHistory = [...deepDive];
     currentQuestions.forEach((q, i) => {
       if (currentAnswers[i]) {
@@ -295,19 +456,25 @@ ${validPlans.map((p, i) => `${i + 1}. ${p}`).join("\n")}
     setDeepDive(newHistory);
 
     if (step === 3) {
-      // Step 3の回答を保存した直後にFinish処理へ
+      if (hasEndedRef.current) return;
+      hasEndedRef.current = true;
       onFinish({ plans, deepDive: newHistory });
       return;
     }
 
     setIsAiLoading(true);
     try {
+      const validPlans = plans.filter(p => p.trim());
       const query = `
-これまでの情報を踏まえ、次は「所要時間」か「出発時間」を1つだけタメ口で質問して。
+ユーザー情報: ${resolveUserProfileForPrompt(userProfile)}。
+以下の各予定と、これまでの対話履歴を踏まえて、予定をさらに深掘りする質問を1つだけタメ口でして。
+すでに聞いた内容は重複しないこと。時間・場所・気持ち・目的・準備・一緒に行く人など、予定ごとに最も自然な観点で質問すること。
 回答形式: 質問1 | 質問2 | ...
 
-これまでの回答:
-${currentAnswers.map((a, i) => `${i + 1}. ${a}`).join("\n")}
+${validPlans.map((p, i) => {
+  const history = newHistory.filter(d => d.planIdx === i);
+  return `予定${i + 1}: ${p}\n対話履歴:\n${history.map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n")}`;
+}).join("\n\n")}
       `.trim();
 
       const res = await sendToDify(query, "guest_user", conversationId);
@@ -316,8 +483,8 @@ ${currentAnswers.map((a, i) => `${i + 1}. ${a}`).join("\n")}
       setCurrentAnswers(new Array(nextQuestions.length).fill(""));
       setStep(step + 1);
     } catch (error) {
-      console.error(error);
-      setCurrentQuestions(currentQuestions.map(() => "何時ごろに出発する予定？"));
+      console.error("[JournalEditor] nextDeepDive / Dify failed", error);
+      setCurrentQuestions(currentQuestions.map(() => "それについて、もう少し教えて？"));
       setCurrentAnswers(new Array(currentQuestions.length).fill(""));
       setStep(step + 1);
     } finally {
@@ -350,7 +517,16 @@ ${currentAnswers.map((a, i) => `${i + 1}. ${a}`).join("\n")}
             <div className="flex flex-col">
             <span className="text-[9px] tracking-[0.6em] uppercase text-stone-400 font-bold mb-2">Mind Mapping</span>
             <div className="flex items-center gap-4">
-              <span className="text-4xl font-light font-mono text-stone-800 tracking-tighter">
+              <span
+                className={cn(
+                  "text-4xl font-light font-mono tracking-tighter transition-colors duration-300",
+                  timeLeft <= 10
+                    ? "text-red-600"
+                    : timeLeft <= 60
+                      ? "text-amber-700"
+                      : "text-stone-800"
+                )}
+              >
                 {formatTime(timeLeft)}
               </span>
               <div className="flex gap-1">
@@ -363,7 +539,14 @@ ${currentAnswers.map((a, i) => `${i + 1}. ${a}`).join("\n")}
             </div>
             </div>
           </div>
-          <button onClick={() => onFinish(null)} className="w-10 h-10 rounded-full bg-white border border-stone-100 flex items-center justify-center text-stone-400 hover:text-stone-800 shadow-sm">
+          <button
+            type="button"
+            onClick={() => {
+              hasEndedRef.current = true;
+              onFinish(null);
+            }}
+            className="w-10 h-10 rounded-full bg-white border border-stone-100 flex items-center justify-center text-stone-400 hover:text-stone-800 shadow-sm"
+          >
             <ArrowLeft size={18} />
           </button>
         </header>
@@ -490,13 +673,14 @@ ${currentAnswers.map((a, i) => `${i + 1}. ${a}`).join("\n")}
             <>
               {step === 1 && (
                 <motion.button
+                  type="button"
                   onClick={startDeepDive}
-                  disabled={!plans[0]}
+                  disabled={!plans[0]?.trim() || timeLeft <= 0}
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
                   className={cn(
                     "group relative w-20 h-20 flex items-center justify-center",
-                    (!plans[0]) && "opacity-20"
+                    (!plans[0]?.trim() || timeLeft <= 0) && "opacity-20"
                   )}
                 >
                   <div className="absolute inset-0 bg-stone-900 rounded-2xl rotate-45 group-hover:rotate-90 transition-transform duration-700 shadow-xl" />
@@ -508,13 +692,14 @@ ${currentAnswers.map((a, i) => `${i + 1}. ${a}`).join("\n")}
               )}
               {(step === 2 || step === 3) && (
                 <motion.button
+                  type="button"
                   onClick={nextDeepDive}
-                  disabled={currentAnswers.every(a => !a)}
+                  disabled={currentAnswers.every((a) => !a) || timeLeft <= 0}
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
                   className={cn(
                     "group relative w-20 h-20 flex items-center justify-center",
-                    (currentAnswers.every(a => !a)) && "opacity-20"
+                    (currentAnswers.every((a) => !a) || timeLeft <= 0) && "opacity-20"
                   )}
                 >
                   <div className="absolute inset-0 bg-stone-900 rounded-2xl rotate-45 group-hover:rotate-90 transition-transform duration-700 shadow-xl" />
@@ -578,10 +763,15 @@ const HistoryView = ({ entries }: { entries: JournalEntry[] }) => {
                 <span className="text-[8px] font-bold tracking-tighter opacity-50 mb-0.5 uppercase">{item.dow}</span>
                 <span className="text-xl font-serif leading-none">{item.day}</span>
               </div>
-            <div className="flex-1 border-b border-stone-100 pt-6 pb-4 group-last:border-none flex items-center">
-              <h3 className="text-lg font-serif font-medium text-stone-800 group-hover:text-stone-500 transition-colors line-clamp-1">
+            <div className="flex-1 border-b border-stone-100 pt-6 pb-4 group-last:border-none flex items-center gap-3 min-w-0">
+              <h3 className="text-lg font-serif font-medium text-stone-800 group-hover:text-stone-500 transition-colors line-clamp-1 min-w-0">
                 {item.plans && item.plans.length > 0 ? item.plans[0] : "No Title"}
               </h3>
+              {item.incomplete ? (
+                <span className="flex-shrink-0 rounded-full border border-amber-200/80 bg-amber-50 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-800">
+                  時間切れ
+                </span>
+              ) : null}
             </div>
           </motion.div>
         ))
@@ -620,6 +810,11 @@ const HistoryView = ({ entries }: { entries: JournalEntry[] }) => {
               </div>
 
               <div className="p-10 pt-16 space-y-10 max-h-[80vh] overflow-y-auto scrollbar-hide">
+                {selectedEntry.incomplete ? (
+                  <div className="rounded-2xl border border-amber-200/70 bg-amber-50/90 px-4 py-3 text-sm text-amber-950 leading-relaxed">
+                    5分の制限時間内に完了しなかったため、途中の内容だけを保存しています。
+                  </div>
+                ) : null}
                 <div className="flex items-center gap-6">
                   <div className="flex flex-col items-center w-14 h-14 bg-stone-900 text-white rounded-2xl justify-center shadow-lg">
                     <span className="text-[7px] font-bold tracking-widest uppercase opacity-60 mb-0.5">{selectedEntry.dow}</span>
@@ -672,124 +867,425 @@ const HistoryView = ({ entries }: { entries: JournalEntry[] }) => {
 );
 };
 
-const InsightsView = ({ entries }: { entries: JournalEntry[] }) => (
-  <motion.div 
-    initial={{ opacity: 0, y: 20 }}
-    animate={{ opacity: 1, y: 0 }}
-    className="space-y-12 pb-40 pt-8"
-  >
-    <h2 className="text-4xl font-serif font-light text-stone-900">Insights</h2>
-    
-    <div className="relative h-80 bg-stone-900 rounded-[3rem] overflow-hidden p-10 flex flex-col justify-between shadow-2xl">
-      <div className="absolute top-0 right-0 p-12 opacity-10">
-        <Sparkles size={160} />
-      </div>
-      
-      <div className="space-y-2 relative z-10">
-        <p className="text-stone-500 text-[10px] tracking-[0.3em] uppercase font-bold">Mental State</p>
-        <h3 className="text-4xl font-serif text-white font-light">
-          {entries.length > 0 ? "穏やかな凪" : "静寂"}
-        </h3>
-      </div>
+const InsightsActivityChart = ({
+  entries,
+  scores,
+  maxScore,
+}: {
+  entries: JournalEntry[];
+  scores: number[];
+  maxScore: number;
+}) => {
+  const VB_W = 360;
+  const VB_H = 152;
+  const padL = 36;
+  const padR = 12;
+  const padT = 12;
+  const padB = 40;
+  const chartW = VB_W - padL - padR;
+  const chartH = VB_H - padT - padB;
+  const n = entries.length;
+  const yBase = padT + chartH;
 
-      <div className="space-y-4 relative z-10">
-        <div className="flex items-end gap-3 h-24">
-          {entries.slice(0, 7).reverse().map((item, i) => (
-            <div key={item.id} className="flex-1 flex flex-col items-center gap-3">
-              <motion.div
-                initial={{ height: 0 }}
-                animate={{ height: `${40 + (i * 10)}%` }} 
-                transition={{ delay: i * 0.1, duration: 1 }}
-                className="w-full bg-white/20 rounded-full hover:bg-white/40 transition-colors cursor-help"
-              />
-              <div className="flex flex-col items-center opacity-40">
-                <span className="text-[8px] font-mono text-white uppercase">{item.dow}</span>
-                <span className="text-[10px] font-serif text-white">{item.day}</span>
-              </div>
+  const pts = scores.map((s, i) => {
+    const x = padL + (n <= 1 ? chartW / 2 : (i / (n - 1)) * chartW);
+    const y = padT + chartH * (1 - s / maxScore);
+    return { x, y, s, item: entries[i] };
+  });
+
+  const lineD =
+    pts.length > 1
+      ? `M ${pts.map((p) => `${p.x} ${p.y}`).join(" L ")}`
+      : pts.length === 1
+        ? `M ${pts[0].x - 18} ${pts[0].y} L ${pts[0].x + 18} ${pts[0].y}`
+        : "";
+
+  const areaD =
+    pts.length > 0
+      ? `M ${pts[0].x} ${yBase} L ${pts.map((p) => `${p.x} ${p.y}`).join(" L ")} L ${pts[pts.length - 1].x} ${yBase} Z`
+      : "";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+      className="w-full"
+    >
+      <svg
+        viewBox={`0 0 ${VB_W} ${VB_H}`}
+        className="h-auto w-full max-h-[200px] overflow-visible"
+        role="img"
+        aria-label="直近の記録ごとの活動スコアの折れ線グラフ"
+      >
+        <defs>
+          <linearGradient id="insightsArea" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.22)" />
+            <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+          </linearGradient>
+          <linearGradient id="insightsBar" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.35)" />
+            <stop offset="100%" stopColor="rgba(255,255,255,0.06)" />
+          </linearGradient>
+        </defs>
+
+        {[0, 0.5, 1].map((t, i) => {
+          const y = padT + chartH * (1 - t);
+          return (
+            <line
+              key={i}
+              x1={padL}
+              y1={y}
+              x2={padL + chartW}
+              y2={y}
+              stroke="rgba(255,255,255,0.08)"
+              strokeDasharray={i === 2 ? "0" : "4 6"}
+              strokeWidth={1}
+            />
+          );
+        })}
+
+        <text x={4} y={padT + 4} fill="rgba(255,255,255,0.35)" fontSize="9" fontFamily="ui-monospace, monospace">
+          {maxScore}
+        </text>
+        <text
+          x={4}
+          y={padT + chartH / 2 + 3}
+          fill="rgba(255,255,255,0.28)"
+          fontSize="9"
+          fontFamily="ui-monospace, monospace"
+        >
+          {Math.round(maxScore / 2)}
+        </text>
+        <text x={4} y={yBase + 3} fill="rgba(255,255,255,0.28)" fontSize="9" fontFamily="ui-monospace, monospace">
+          0
+        </text>
+
+        {pts.map((p) => {
+          const barW = Math.min(14, chartW / Math.max(n * 1.8, 4));
+          return (
+            <rect
+              key={`bar-${p.item.id}`}
+              x={p.x - barW / 2}
+              y={p.y}
+              width={barW}
+              height={Math.max(0, yBase - p.y)}
+              rx={3}
+              fill="url(#insightsBar)"
+              opacity={0.85}
+            />
+          );
+        })}
+
+        {areaD ? <path d={areaD} fill="url(#insightsArea)" /> : null}
+
+        {lineD ? (
+          <motion.path
+            d={lineD}
+            fill="none"
+            stroke="rgba(255,255,255,0.55)"
+            strokeWidth={2}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            initial={{ pathLength: 0, opacity: 0.4 }}
+            animate={{ pathLength: 1, opacity: 1 }}
+            transition={{ duration: 1, ease: [0.22, 1, 0.36, 1] }}
+          />
+        ) : null}
+
+        {pts.map((p) => {
+          const plans = p.item.plans?.filter((x) => x.trim()).length ?? 0;
+          const dives = p.item.deepDive?.length ?? 0;
+          const dateStr = new Date(p.item.date).toLocaleDateString("ja-JP", {
+            month: "numeric",
+            day: "numeric",
+          });
+          const tip = `${dateStr} · スコア ${p.s}（予定 ${plans}・対話 ${dives}）`;
+          return (
+            <g key={p.item.id}>
+              <circle
+                cx={p.x}
+                cy={p.y}
+                r={5}
+                fill="rgb(28 25 23)"
+                stroke="rgba(255,255,255,0.85)"
+                strokeWidth={1.5}
+              >
+                <title>{tip}</title>
+              </circle>
+              <text
+                x={p.x}
+                y={yBase + 14}
+                textAnchor="middle"
+                fill="rgba(255,255,255,0.4)"
+                fontSize="8"
+                fontFamily="ui-monospace, monospace"
+                letterSpacing="0.02em"
+              >
+                {p.item.dow}
+              </text>
+              <text
+                x={p.x}
+                y={yBase + 26}
+                textAnchor="middle"
+                fill="rgba(255,255,255,0.55)"
+                fontSize="11"
+                fontFamily="ui-serif, Georgia, serif"
+              >
+                {p.item.day}
+              </text>
+              <text
+                x={p.x}
+                y={yBase + 38}
+                textAnchor="middle"
+                fill="rgba(255,255,255,0.35)"
+                fontSize="9"
+                fontFamily="ui-monospace, monospace"
+              >
+                {p.s}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </motion.div>
+  );
+};
+
+const InsightsView = ({ entries }: { entries: JournalEntry[] }) => {
+  const total = entries.length;
+  const latest = total > 0 ? entries[0] : null;
+  const recentChrono = [...entries].slice(0, 7).reverse();
+
+  const activityScore = (e: JournalEntry) =>
+    (e.plans?.filter((p) => p.trim()).length ?? 0) + (e.deepDive?.length ?? 0);
+
+  const scores = recentChrono.map(activityScore);
+  const maxScore = Math.max(1, ...scores);
+
+  const gentleDip = (() => {
+    if (latest?.incomplete || scores.length < 2) return false;
+    const newest = scores[scores.length - 1];
+    const prev = scores.slice(0, -1);
+    const prevAvg = prev.reduce((a, b) => a + b, 0) / prev.length;
+    const newestPlans =
+      recentChrono[recentChrono.length - 1]?.plans?.filter((p) => p.trim()).length ?? 0;
+    const prevPlanAvgs = recentChrono
+      .slice(0, -1)
+      .map((e) => e.plans?.filter((p) => p.trim()).length ?? 0);
+    const prevPlanAvg =
+      prevPlanAvgs.length > 0
+        ? prevPlanAvgs.reduce((a, b) => a + b, 0) / prevPlanAvgs.length
+        : 0;
+    const scoreDip = newest + 1e-6 < prevAvg;
+    const planDip =
+      prevPlanAvgs.length > 0 && newestPlans + 1e-6 < prevPlanAvg;
+    return scoreDip || planDip;
+  })();
+
+  const rhythmTitle = gentleDip ? "いまは、ゆとりのフェーズ" : "直近の手応え";
+
+  const latestLead =
+    latest?.incomplete
+      ? (latest.plans.map((p) => p.trim()).find((p) => p && !p.startsWith("（")) ?? "")
+      : (latest?.plans?.map((p) => p.trim()).find(Boolean) ?? "");
+  const focusPreview =
+    latestLead.length > 0
+      ? latestLead.length > 40
+        ? `${latestLead.slice(0, 40)}…`
+        : latestLead
+      : total > 0 && latest?.incomplete
+        ? "時間切れで保存された記録"
+        : total > 0
+          ? "（予定テキストなし）"
+          : "—";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="space-y-12 pb-40 pt-8"
+    >
+      <h2 className="text-4xl font-serif font-light text-stone-900">Insights</h2>
+
+      <div className="relative min-h-[20rem] bg-gradient-to-br from-stone-900 via-stone-900 to-stone-800 rounded-[3rem] overflow-hidden p-8 sm:p-10 shadow-2xl ring-1 ring-white/10">
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_30%_0%,rgba(255,255,255,0.1),transparent_55%)] pointer-events-none" />
+        <div className="absolute top-0 right-0 p-8 opacity-[0.06] pointer-events-none">
+          <Sparkles size={120} className="text-white" />
+        </div>
+
+        <div className="relative z-10 flex flex-col gap-6">
+          <div className="space-y-2">
+            <p className="text-stone-500 text-[10px] tracking-[0.3em] uppercase font-bold">
+              Activity
+            </p>
+            <p className="text-xl sm:text-2xl font-serif text-white/95 font-light tracking-tight leading-snug">
+              {rhythmTitle}
+            </p>
+          </div>
+
+          {total === 0 ? (
+            <div className="flex min-h-[12rem] flex-col items-center justify-center rounded-2xl border border-dashed border-white/15 bg-white/[0.04]">
+              <BarChart3 className="mb-3 text-white/20" size={36} strokeWidth={1} />
+              <p className="text-sm text-stone-400 font-serif">記録があるとグラフが表示されます</p>
             </div>
-          ))}
-          {entries.length === 0 && (
-            <div className="w-full h-full flex items-center justify-center opacity-10">
-              <p className="text-xs text-white tracking-[0.5em]">NO DATA</p>
-            </div>
+          ) : (
+            <InsightsActivityChart entries={recentChrono} scores={scores} maxScore={maxScore} />
           )}
         </div>
       </div>
-    </div>
 
-    <div className="grid grid-cols-2 gap-6">
-      <div className="p-8 bg-white border border-stone-100 rounded-[2.5rem] space-y-4 shadow-sm">
-        <div className="w-10 h-10 bg-stone-50 rounded-2xl flex items-center justify-center text-stone-800">
-          <Zap size={20} />
+      <div className="grid grid-cols-2 gap-6">
+        <div className="p-8 bg-white border border-stone-100 rounded-[2.5rem] space-y-4 shadow-sm">
+          <div className="w-10 h-10 bg-stone-50 rounded-2xl flex items-center justify-center text-stone-800">
+            <Zap size={20} />
+          </div>
+          <div>
+            <p className="tracking-widest uppercase mb-1 leading-tight">
+              <span className="text-stone-500 text-[11px] font-bold">Total</span>
+              <br />
+              <span className="text-stone-300 text-[9px]">累計ジャーナル数</span>
+            </p>
+            <p className="text-3xl font-serif text-stone-800">{total.toString().padStart(2, "0")}</p>
+          </div>
         </div>
-        <div>
-          <p className="tracking-widest uppercase mb-1 leading-tight">
-            <span className="text-stone-500 text-[11px] font-bold">Journey</span>
-            <br />
-            <span className="text-stone-300 text-[9px]">累計投稿数</span>
-          </p>
-          <p className="text-3xl font-serif text-stone-800">{entries.length.toString().padStart(2, "0")}</p>
+        <div className="p-8 bg-white border border-stone-100 rounded-[2.5rem] space-y-4 shadow-sm">
+          <div className="w-10 h-10 bg-stone-50 rounded-2xl flex items-center justify-center text-stone-800">
+            <Cloud size={20} />
+          </div>
+          <div>
+            <p className="tracking-widest uppercase mb-1 leading-tight">
+              <span className="text-stone-500 text-[11px] font-bold">Latest</span>
+              <br />
+              <span className="text-stone-300 text-[9px]">最新の先頭の予定</span>
+            </p>
+            <p className="text-lg font-serif text-stone-800 leading-snug line-clamp-2">{focusPreview}</p>
+          </div>
         </div>
       </div>
-      <div className="p-8 bg-white border border-stone-100 rounded-[2.5rem] space-y-4 shadow-sm">
-        <div className="w-10 h-10 bg-stone-50 rounded-2xl flex items-center justify-center text-stone-800">
-          <Cloud size={20} />
-        </div>
-        <div>
-          <p className="tracking-widest uppercase mb-1 leading-tight">
-            <span className="text-stone-500 text-[11px] font-bold">Focus</span>
-            <br />
-            <span className="text-stone-300 text-[9px]">現在のテーマ</span>
-          </p>
-          <p className="text-3xl font-serif text-stone-800">{entries.length > 0 ? "Self" : "--"}</p>
-        </div>
-      </div>
-    </div>
-  </motion.div>
-);
+    </motion.div>
+  );
+};
 
-const SettingsView = () => (
-  <motion.div 
-    initial={{ opacity: 0, y: 20 }}
-    animate={{ opacity: 1, y: 0 }}
-    className="space-y-12 pb-40 pt-8"
-  >
-    <h2 className="text-4xl font-serif font-light text-stone-900">Settings</h2>
+const SettingsView = ({
+  userProfile,
+  onChangeUserProfile,
+}: {
+  userProfile: UserProfileData;
+  onChangeUserProfile: (next: UserProfileData) => void;
+}) => {
+  const updateField = (field: keyof Omit<UserProfileData, "hobbies">, value: string) => {
+    onChangeUserProfile({ ...userProfile, [field]: value });
+  };
 
-    <div className="space-y-10">
-      <div className="flex items-center gap-8">
-        <div className="w-24 h-24 bg-stone-100 rounded-[2rem] flex items-center justify-center text-stone-300 shadow-inner">
-          <User size={40} />
-        </div>
-        <div className="space-y-1">
-          <h3 className="text-2xl font-serif font-light text-stone-800">Guest User</h3>
-          <p className="text-xs text-stone-400 font-mono tracking-widest uppercase">Standard Member</p>
-        </div>
-      </div>
+  const updateHobby = (index: number, value: string) => {
+    const nextHobbies = [...userProfile.hobbies];
+    nextHobbies[index] = value;
+    onChangeUserProfile({ ...userProfile, hobbies: nextHobbies });
+  };
 
-      <div className="grid gap-4">
-        {[
-          { icon: CreditCard, label: "Subscription", detail: "Manage Plan" },
-          { icon: Moon, label: "Appearance", detail: "Light Mode" },
-          { icon: LogOut, label: "Sign Out", detail: "", color: "text-red-400" },
-        ].map((item, i) => (
-          <button key={i} className="w-full group flex items-center justify-between p-2">
-            <div className="flex items-center gap-6">
-              <div className="w-12 h-12 bg-stone-50 rounded-2xl flex items-center justify-center text-stone-300 group-hover:bg-stone-900 group-hover:text-white transition-all duration-500 shadow-sm">
-                <item.icon size={20} />
-              </div>
-              <div className="text-left">
-                <p className={cn("text-sm font-medium", item.color || "text-stone-800")}>{item.label}</p>
-                {item.detail && <p className="text-[10px] text-stone-300 uppercase tracking-widest">{item.detail}</p>}
-              </div>
+  const addHobby = () => {
+    onChangeUserProfile({ ...userProfile, hobbies: [...userProfile.hobbies, ""] });
+  };
+
+  const removeHobby = (index: number) => {
+    const filtered = userProfile.hobbies.filter((_, i) => i !== index);
+    onChangeUserProfile({
+      ...userProfile,
+      hobbies: filtered.length > 0 ? filtered : [""],
+    });
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="space-y-12 pb-40 pt-8"
+    >
+      <h2 className="text-4xl font-serif font-light text-stone-900">Settings</h2>
+
+      <div className="space-y-6">
+        <div className="flex items-center gap-8">
+          <div className="w-24 h-24 bg-stone-100 rounded-[2rem] flex items-center justify-center text-stone-300 shadow-inner">
+            <User size={40} />
+          </div>
+          <div className="space-y-1">
+            <h3 className="text-2xl font-serif font-light text-stone-800">User Profile</h3>
+            <p className="text-xs text-stone-400 font-mono tracking-widest uppercase">Local Settings</p>
+          </div>
+        </div>
+        <p className="text-sm text-stone-500 leading-relaxed">
+          User Profileを設定すると、AIの精度が上がります。
+        </p>
+
+        <div className="space-y-5">
+          <div className="space-y-2">
+            <label className="block text-xs tracking-widest uppercase text-stone-400 font-bold">住まい</label>
+            <input
+              value={userProfile.residence}
+              onChange={(e) => updateField("residence", e.target.value)}
+              placeholder="例: 東京都世田谷区"
+              className="w-full bg-white/60 backdrop-blur-sm border border-stone-200/50 rounded-2xl p-4 text-base font-serif text-stone-800 placeholder-stone-300 outline-none focus:border-stone-300 transition-all"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-xs tracking-widest uppercase text-stone-400 font-bold">年齢</label>
+            <input
+              value={userProfile.age}
+              onChange={(e) => updateField("age", e.target.value)}
+              placeholder="例: 29"
+              className="w-full bg-white/60 backdrop-blur-sm border border-stone-200/50 rounded-2xl p-4 text-base font-serif text-stone-800 placeholder-stone-300 outline-none focus:border-stone-300 transition-all"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-xs tracking-widest uppercase text-stone-400 font-bold">職業</label>
+            <input
+              value={userProfile.occupation}
+              onChange={(e) => updateField("occupation", e.target.value)}
+              placeholder="例: Webエンジニア"
+              className="w-full bg-white/60 backdrop-blur-sm border border-stone-200/50 rounded-2xl p-4 text-base font-serif text-stone-800 placeholder-stone-300 outline-none focus:border-stone-300 transition-all"
+            />
+          </div>
+
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <label className="block text-xs tracking-widest uppercase text-stone-400 font-bold">趣味</label>
+              <button
+                type="button"
+                onClick={addHobby}
+                className="text-[10px] tracking-widest uppercase text-stone-500 hover:text-stone-800 transition-colors"
+              >
+                + Add Hobby
+              </button>
             </div>
-            <ChevronRight size={16} className="text-stone-200 group-hover:translate-x-2 transition-transform duration-500" />
-          </button>
-        ))}
+            <div className="space-y-3">
+              {userProfile.hobbies.map((hobby, i) => (
+                <div key={i} className="flex items-center gap-3">
+                  <input
+                    value={hobby}
+                    onChange={(e) => updateHobby(i, e.target.value)}
+                    placeholder={`趣味 ${i + 1}`}
+                    className="flex-1 bg-white/60 backdrop-blur-sm border border-stone-200/50 rounded-2xl p-4 text-base font-serif text-stone-800 placeholder-stone-300 outline-none focus:border-stone-300 transition-all"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeHobby(i)}
+                    className="w-10 h-10 rounded-full bg-stone-50 border border-stone-100 text-stone-400 hover:text-red-400 transition-colors flex items-center justify-center"
+                    aria-label={`remove-hobby-${i + 1}`}
+                  >
+                    <Plus size={16} className="rotate-45" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
-    </div>
-  </motion.div>
-);
+    </motion.div>
+  );
+};
 
 // --- Main Page ---
 
@@ -798,9 +1294,13 @@ export default function Home() {
   const [isWriting, setIsWriting] = useState(false);
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [showLatestEntry, setShowLatestEntry] = useState<JournalEntry | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfileData>(EMPTY_USER_PROFILE);
+  const [profileReady, setProfileReady] = useState(false);
 
   useEffect(() => {
     setEntries(getEntries());
+    setUserProfile(getUserProfile());
+    setProfileReady(true);
 
     const handleClose = () => {
       setIsWriting(false);
@@ -810,15 +1310,27 @@ export default function Home() {
     return () => window.removeEventListener('close-editor', handleClose);
   }, []);
 
-  const handleFinishWriting = async (data: { plans: string[], deepDive: { question: string, answer: string, planIdx: number }[] } | null) => {
-    if (data) {
-      const updated = await saveEntry(data.plans, data.deepDive);
+  useEffect(() => {
+    if (!profileReady) return;
+    saveUserProfile(userProfile);
+  }, [userProfile, profileReady]);
+
+  const handleFinishWriting = async (data: JournalFinishPayload | null) => {
+    if (!data) {
+      setIsWriting(false);
+      return;
+    }
+    if (data.incomplete) {
+      const updated = saveIncompleteEntry(data.plans, data.deepDive);
       setEntries(updated);
       setIsWriting(false);
-      setShowLatestEntry(updated[0]); // 最新の投稿をモーダルで表示
-    } else {
-      setIsWriting(false);
+      setShowLatestEntry(updated[0]);
+      return;
     }
+    const updated = await saveEntry(data.plans, data.deepDive, userProfile);
+    setEntries(updated);
+    setIsWriting(false);
+    setShowLatestEntry(updated[0]);
   };
 
   const handleClearData = () => {
@@ -828,6 +1340,7 @@ export default function Home() {
   };
 
   return (
+    <>
     <div className="min-h-screen bg-[#FDFCFB] font-sans text-stone-900 selection:bg-stone-100 relative overflow-hidden">
       {/* 全画面共通のアンビエント背景 */}
       <div className="fixed inset-0 pointer-events-none z-0">
@@ -851,12 +1364,18 @@ export default function Home() {
           )}
           {activeTab === "history" && <HistoryView key="history" entries={entries} />}
           {activeTab === "insights" && <InsightsView key="insights" entries={entries} />}
-          {activeTab === "settings" && <SettingsView key="settings" />}
+          {activeTab === "settings" && (
+            <SettingsView
+              key="settings"
+              userProfile={userProfile}
+              onChangeUserProfile={setUserProfile}
+            />
+          )}
         </AnimatePresence>
 
         <AnimatePresence>
           {isWriting && (
-            <JournalEditor key="editor" onFinish={handleFinishWriting} />
+            <JournalEditor key="editor" onFinish={handleFinishWriting} userProfile={userProfile} />
           )}
         </AnimatePresence>
 
@@ -893,6 +1412,11 @@ export default function Home() {
                 </div>
 
                 <div className="p-10 pt-16 space-y-10 max-h-[80vh] overflow-y-auto scrollbar-hide">
+                  {showLatestEntry.incomplete ? (
+                    <div className="rounded-2xl border border-amber-200/70 bg-amber-50/90 px-4 py-3 text-sm text-amber-950 leading-relaxed">
+                      5分の制限時間内に完了しなかったため、途中の内容だけを保存しています。
+                    </div>
+                  ) : null}
                   <div className="flex items-center gap-6">
                     <div className="flex flex-col items-center w-14 h-14 bg-stone-900 text-white rounded-2xl justify-center shadow-lg">
                       <span className="text-[7px] font-bold tracking-widest uppercase opacity-60 mb-0.5">{showLatestEntry.dow}</span>
@@ -941,9 +1465,9 @@ export default function Home() {
             </motion.div>
           )}
         </AnimatePresence>
-
-        <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} onClear={handleClearData} />
       </div>
     </div>
+    <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} onClear={handleClearData} />
+    </>
   );
 }
